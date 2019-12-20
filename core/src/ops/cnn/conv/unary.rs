@@ -135,9 +135,7 @@ impl ConvUnary {
         Ok(packed_as.insert_axis(Axis(0)))
     }
 
-    fn bias_as_non_linear<T>(
-        &self,
-    ) -> TractResult<Option<ArrayD<Vec<FusedSpec<T>>>>>
+    fn bias_as_non_linear<T>(&self) -> TractResult<Option<ArrayD<Vec<FusedSpec<T>>>>>
     where
         T: Datum + Copy,
     {
@@ -173,22 +171,22 @@ impl ConvUnary {
         if (a, b) == (f32::datum_type(), f32::datum_type()) {
             return self.wire_as_im2col_pair_t(model, name, wire, direct, &|m, k, n| {
                 MMMWrapper::Plain((tract_linalg::ops().smmm)(m, k, n))
-            })
+            });
         } else if (a, b) == (u8::datum_type(), u8::datum_type()) {
             return self.wire_as_im2col_pair_t(model, name, wire, direct, &|m, k, n| {
                 MMMWrapper::Quant((tract_linalg::ops().qmmm_u8_i32)(m, k, n))
-            })
+            });
         } else if (a, b) == (i8::datum_type(), i8::datum_type()) {
             if let Some(q) = &self.q_params {
                 if q.c_datum_type == i8::datum_type() {
                     return self.wire_as_im2col_pair_t(model, name, wire, direct, &|m, k, n| {
                         MMMWrapper::Quant((tract_linalg::ops().qmmm_i8_i8)(m, k, n))
-                    })
+                    });
                 }
             } else {
                 return self.wire_as_im2col_pair_t(model, name, wire, direct, &|m, k, n| {
                     MMMWrapper::Quant((tract_linalg::ops().qmmm_i8_i32)(m, k, n))
-                })
+                });
             }
         }
         bail!("Unsupported combination for Conv (filters: {:?}, data:{:?})", a, b);
@@ -221,8 +219,8 @@ impl ConvUnary {
 
         let mut mmm = mmm(m, k, n);
         let (rsc, csc) = match output_shape.fmt {
-            DataFormat::NHWC => (1, self.output_channels() as isize),
-            DataFormat::NCHW => (n as isize, 1),
+            DataFormat::NHWC|DataFormat::HWC => (1, self.output_channels() as isize),
+            DataFormat::NCHW|DataFormat::CHW => (n as isize, 1),
         };
         mmm.as_mmm_mut().c_from_data_and_strides(rsc, csc);
 
@@ -230,7 +228,13 @@ impl ConvUnary {
             mmm.set_quant_params(q)?;
         }
 
-        trace!("Gemm iters={} m={} k={} n={}", input_shape.n_dim() * self.group, m, k, n);
+        trace!(
+            "Gemm iters={} m={} k={} n={}",
+            input_shape.n_dim().unwrap_or(&1) * self.group,
+            m,
+            k,
+            n
+        );
         trace!("{:?}", mmm);
 
         if direct {
@@ -268,14 +272,15 @@ impl ConvUnary {
             )?[0];
         }
 
-        let c_prefix_dim_and_stride = if *output_shape.n() != 1 || self.group != 1 {
-            Some((
-                tvec!(*output_shape.n(), self.group),
-                tvec![
-                    *output_shape.n_stride() as isize,
-                    (output_shape.c() / self.group * output_shape.c_stride()) as isize
-                ],
-            ))
+        let c_prefix_dim_and_stride = if *output_shape.n().unwrap_or(&1) != 1 || self.group != 1 {
+            let mut dims = tvec!(self.group as usize);
+            let mut strides =
+                tvec!((output_shape.c() / self.group * output_shape.c_stride()) as isize);
+            if output_shape.n().is_some() {
+                dims.insert(0, *output_shape.n().unwrap());
+                strides.insert(0, *output_shape.n_stride().unwrap() as isize);
+            }
+            Some((dims, strides))
         } else {
             None
         };
@@ -354,7 +359,10 @@ impl TypedOp for ConvUnary {
     fn invariants(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Invariants> {
         let fact = model.outlet_fact(node.inputs[0])?;
         let shape = self.pool_spec.data_format.shape(fact.shape.iter().collect::<Vec<TDim>>());
-        let mut axes = vec![AxisInfo::simple(0).disposable(false)];
+        let mut axes = vec![];
+        if let Some(n_axis) = shape.n_axis() {
+            axes.push(AxisInfo::simple(n_axis).disposable(true));
+        }
         let kernel_spatial_shape =
             &self.kernel.shape()[self.kernel_fmt.h_axis()..][..shape.hw_rank()];
         let h_axis = shape.h_axis();
@@ -372,8 +380,7 @@ impl TypedOp for ConvUnary {
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
         let input_fact = model.outlet_fact(node.inputs[0])?;
-        let full_input_shape = input_fact.shape.to_tvec();
-        let spatial_rank = full_input_shape.len() - 2;
+        let spatial_rank = self.kernel.rank() - 2;
         if let Some(axis) = (0..spatial_rank).find(|&ax| {
             self.pool_spec.padding.valid_dim(ax)
                 && self.pool_spec.stride(ax) > 1
@@ -414,9 +421,10 @@ impl TypedOp for ConvUnary {
         let n_output_points: TDim = output_dims.iter().map(|d| d.output.clone()).product::<TDim>();
         let n_output_channels = self.output_channels().to_dim();
         let kernel_surface = kernel_spatial_shape.into_iter().product::<usize>().to_dim();
+        let one = 1.to_dim();
         Ok(tvec!((
             Cost::FMA(inputs[0].datum_type),
-            shape.n().clone() * shape.c() * n_output_channels * n_output_points * kernel_surface
+            shape.n().unwrap_or(&one).clone() * shape.c() * n_output_channels * n_output_points * kernel_surface
                 / self.group
         )))
     }
@@ -429,8 +437,14 @@ impl TypedOp for ConvUnary {
     ) -> TractResult<Option<Box<dyn TypedOp>>> {
         let full_input_shape = model.outlet_fact(node.inputs[0])?.shape.to_tvec();
         let shape = self.pool_spec.data_format.shape(full_input_shape);
-        if axis < shape.h_axis() {
-            bail!("Only spatial axis can be disposed of.");
+        if Some(axis) == shape.n_axis() {
+            return Ok(Some(Box::new(ConvUnary {
+                pool_spec: self.pool_spec.dispose_n_axis(),
+                .. self.clone()
+            })))
+        }
+        if axis == shape.c_axis() {
+            bail!("Channel axis can not be disposed of");
         }
         let geo_axis = axis - shape.h_axis();
         if geo_axis >= shape.hw_rank() {
@@ -489,7 +503,8 @@ impl TypedOp for ConvUnary {
     ) -> TractResult<Option<TypedModelPatch>> {
         let full_input_shape = model.outlet_fact(node.inputs[0])?.shape.to_tvec();
         let input_fact = model.outlet_fact(node.inputs[0])?;
-        let spatial_rank = full_input_shape.len() - 2;
+        let input_shape = self.pool_spec.data_format.shape(&full_input_shape);
+        let spatial_rank = input_shape.hw_rank();
         let kernel_spatial_shape = &self.kernel.shape()[self.kernel_fmt.h_axis()..][..spatial_rank];
         if let Some(shape) = input_fact.shape.as_finite() {
             unsafe {
@@ -500,7 +515,7 @@ impl TypedOp for ConvUnary {
                     && self.group == 1
                 {
                     if self.kernel_fmt == KernelFormat::HWIO
-                        && self.pool_spec.data_format == DataFormat::NHWC
+                        && input_shape.c_axis() == input_shape.rank() - 1
                     {
                         use crate::ops::math::mat_mul::MatMulUnary;
                         let mut patch = TypedModelPatch::default();
@@ -508,8 +523,8 @@ impl TypedOp for ConvUnary {
                         wire = patch.wire_node(
                             &*node.name,
                             TypedReshape::new(tvec!(
-                                full_input_shape[0].clone(),
-                                full_input_shape[1..][..full_input_shape.len() - 2]
+                                input_shape.n().cloned().unwrap_or(1.to_dim()),
+                                input_shape.hw_dims()
                                     .iter()
                                     .cloned()
                                     .product::<TDim>(),
@@ -530,6 +545,13 @@ impl TypedOp for ConvUnary {
                             ),
                             &[wire],
                         )?[0];
+                        if let Some(ref bias) = self.bias {
+                            wire = patch.wire_node(
+                                format!("{}-bias", node.name),
+                                crate::ops::math::add::unary(bias.clone()),
+                                &[wire],
+                            )?[0];
+                        }
                         wire = patch.wire_node(
                             &*node.name,
                             TypedReshape::new(node.outputs[0].fact.shape.to_tvec()),

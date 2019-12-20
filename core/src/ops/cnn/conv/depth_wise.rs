@@ -40,21 +40,22 @@ where
         let k_stride_o = self.kernel_chw.strides()[0];
         let k_stride_i = self.kernel_chw.strides()[1];
         let mult = *self.output_shape.c() / *self.input_shape.c();
+        let n = *self.input_shape.n().unwrap_or(&1);
+        let n_stride_i = *self.input_shape.n_stride().unwrap_or(&0);
+        let n_stride_o = *self.output_shape.n_stride().unwrap_or(&0);
+        let c_stride_i = *self.input_shape.c_stride();
+        let c_stride_o = *self.output_shape.c_stride();
         unsafe {
             self.patch.visit_output(|visitor| {
-                for n in 0..*self.input_shape.n() {
-                    let input_offset = *self.input_shape.n_stride() * n;
-                    let output_offset = *self.output_shape.n_stride() * n;
+                for n in 0..n {
+                    let input_offset = n_stride_i * n;
+                    let output_offset = n_stride_o * n;
                     for c in 0..*self.input_shape.c() {
-                        let input_offset = input_offset + self.input_shape.c_stride() * c;
+                        let input_offset = input_offset + c_stride_i * c;
                         for m in 0..mult {
-                            let mut sum = if let Some(b) = &self.bias {
-                                b[m + c * mult]
-                            } else {
-                                T::zero()
-                            };
-                            let output_offset =
-                                output_offset + self.output_shape.c_stride() * (m + c * mult);
+                            let mut sum =
+                                if let Some(b) = &self.bias { *b.get_unchecked(m + c * mult) } else { T::zero() };
+                            let output_offset = output_offset + c_stride_o * (m + c * mult);
                             let kptr = self
                                 .kernel_chw
                                 .as_ptr()
@@ -87,7 +88,7 @@ where
         let n_output_points = self.patch.output_shape.iter().cloned().product::<usize>();
         Ok(tvec!((
             Cost::FMA(T::datum_type()),
-            (self.input_shape.n() * n_output_points * self.kernel_chw.len()).to_dim()
+            (self.input_shape.n().unwrap_or(&1) * n_output_points * self.kernel_chw.len()).to_dim()
         )))
     }
 

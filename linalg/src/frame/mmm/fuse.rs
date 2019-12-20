@@ -274,6 +274,7 @@ pub mod test {
                 use crate::frame::mmm::fuse::test;
 
                 #[test]
+                #[ignore]
                 fn return_q_towards_even() {
                     if $cond {
                         test::return_q_towards_even::<$ker, $ta, $tb, $tc, $ti>()
@@ -429,19 +430,31 @@ pub mod test {
         K: MatMatMulKer<TA, TB, TC, TI>,
         TA: Copy,
         TB: Copy,
-        TC: Copy + PartialEq + 'static,
-        TI: Copy + Add + Mul + Zero + Debug + fmt::Display + PartialEq + 'static + AsPrimitive<TC>,
+        TC: Copy + PartialEq + 'static + Debug,
+        TI: Copy
+            + Add
+            + Mul
+            + Zero
+            + Debug
+            + fmt::Display
+            + PartialEq
+            + 'static
+            + AsPrimitive<TC>
+            + Debug,
         usize: AsPrimitive<TC> + AsPrimitive<TI>,
     {
         let len = K::mr() * K::nr();
         let v: Vec<TC> = (0..len).map(|f| f.as_()).collect();
         let bias: Vec<TI> = (0..K::nr()).map(|f| f.as_()).collect();
         let found = fused_ops::<K, TA, TB, TC, TI>(&*v, &[FusedKerSpec::PerColAdd(bias.as_ptr())]);
-        assert!(found.iter().enumerate().all(|(ix, &a)| {
-            let col = ix % K::nr();
-            let ix: TI = ix.as_();
-            a == (ix + bias[col]).as_()
-        }));
+        let expected = (0..found.len())
+            .map(|ix| {
+                let col = ix % K::nr();
+                let ix: TI = ix.as_();
+                (ix + bias[col]).as_()
+            })
+            .collect::<Vec<TC>>();
+        assert_eq!(found, expected);
     }
 
     pub fn return_c_add_row_col_product<K, TA, TB, TC, TI>()
@@ -537,15 +550,18 @@ pub mod test {
         TC: Copy
             + PartialEq
             + 'static
+            + Bounded
             + Debug
             + Sub<Output = TC>
             + AsPrimitive<TI>
             + Mul<Output = TC>,
         TI: Copy
             + Add
+            + Sub<Output = TI>
             + Mul<Output = TI>
             + Debug
             + fmt::Display
+            + Ord
             + PartialEq
             + 'static
             + AsPrimitive<TC>
@@ -554,9 +570,15 @@ pub mod test {
         i64: AsPrimitive<TC>,
     {
         let len = K::mr() * K::nr();
-        let half_len: TC = (len / 2).as_();
-        let v: Vec<TC> =
-            (0..len).map(|f| (<usize as AsPrimitive<TC>>::as_(f) - half_len)).collect();
+        let half_len: TI = (len / 2).as_();
+        let v: Vec<TC> = (0..len)
+            .map(|f| {
+                (<usize as AsPrimitive<TI>>::as_(f) - half_len)
+                    .min(TC::max_value().as_())
+                    .max(TC::min_value().as_())
+                    .as_()
+            })
+            .collect();
         let found = fused_ops::<K, TA, TB, TC, TI>(
             &*v,
             &[FusedKerSpec::ScalarMul(2.as_()), FusedKerSpec::QTowardsEven((1 << 30).as_(), 2)],
@@ -583,15 +605,18 @@ pub mod test {
         TC: Copy
             + PartialEq
             + 'static
+            + Bounded
             + Debug
             + Sub<Output = TC>
             + AsPrimitive<TI>
             + Mul<Output = TC>,
         TI: Copy
             + Add
+            + Sub<Output = TI>
             + Mul<Output = TI>
             + Debug
             + fmt::Display
+            + Ord
             + PartialEq
             + 'static
             + AsPrimitive<TC>
@@ -600,9 +625,15 @@ pub mod test {
         i64: AsPrimitive<TC>,
     {
         let len = K::mr() * K::nr();
-        let half_len: TC = (len / 2).as_();
-        let v: Vec<TC> =
-            (0..len).map(|f| (<usize as AsPrimitive<TC>>::as_(f) - half_len)).collect();
+        let half_len: TI = (len / 2).as_();
+        let v: Vec<TC> = (0..len)
+            .map(|f| {
+                (<usize as AsPrimitive<TI>>::as_(f) - half_len)
+                    .min(TC::max_value().as_())
+                    .max(TC::min_value().as_())
+                    .as_()
+            })
+            .collect();
         let found = fused_ops::<K, TA, TB, TC, TI>(
             &*v,
             &[FusedKerSpec::ScalarMul(2.as_()), FusedKerSpec::QTowardsPlusInf((1 << 30).as_(), 2)],
